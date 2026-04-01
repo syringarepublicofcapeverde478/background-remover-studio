@@ -103,6 +103,10 @@ I18N = {
         "manual_tip": "Paint on the right preview. Hold Shift or use Move to pan while zoomed.",
         "hair_protect": "Hair Protect",
         "hair_protect_sub": "Preserve fine strands and trim loose background near hair.",
+        "sticker_mode": "Sticker Mode",
+        "sticker_mode_sub": "Flood-fill removes only the outer background. Keeps white areas inside the design intact.",
+        "export_resized_original": "Export Resized Original",
+        "export_resized_original_sub": "Saves the original image at the chosen dimensions, without removing the background.",
         "toggle_adjustments_hide": "Hide Adjustments",
         "toggle_adjustments_show": "Show Adjustments",
         "quick_tools": "Quick Tools",
@@ -226,6 +230,10 @@ I18N = {
         "manual_tip": "Pinte no preview da direita. Segure Shift ou use Mover para navegar com zoom.",
         "hair_protect": "Proteger Cabelo",
         "hair_protect_sub": "Preserva fios finos e corta restos soltos perto do cabelo.",
+        "sticker_mode": "Modo Sticker",
+        "sticker_mode_sub": "Flood fill remove apenas o fundo externo. Preserva áreas brancas internas do design.",
+        "export_resized_original": "Exportar Original Redimensionado",
+        "export_resized_original_sub": "Salva a imagem original nas dimensões escolhidas, sem remover o fundo.",
         "toggle_adjustments_hide": "Ocultar Ajustes",
         "toggle_adjustments_show": "Mostrar Ajustes",
         "quick_tools": "Ferramentas Rápidas",
@@ -1013,6 +1021,98 @@ def processing_profile(width: int, height: int, threshold: int):
 
     return erode_size, clean_threshold, edge_radius
 
+
+def remover_fundo_sticker(img: Image.Image, tolerance: int = 35, edge_barrier: float = 20.0) -> Image.Image:
+    """
+    Remove apenas o fundo EXTERNO usando flood fill morfológico com barreira de gradiente.
+
+    Estratégia:
+      1. Pixels similares à cor do fundo E sem transição brusca de cor são "inundáveis".
+      2. Pixels com forte variação de cor nos vizinhos (bordas do design) bloqueiam
+         a propagação — isso impede que o flood fill cruze o contorno do sticker e
+         entre nas áreas brancas internas.
+      3. Após o flood fill, pixels internos isolados que ficaram transparentes são
+         restaurados (ex: pontos brancos de halftone completamente cercados pelo design).
+    """
+    img_rgba = img.convert("RGBA")
+    arr = np.array(img_rgba, dtype=np.uint8)
+    h, w = arr.shape[:2]
+
+    # ── Cor do fundo (mediana das bordas) ──────────────────────
+    edge_pixels = np.concatenate([
+        arr[0, :, :3],
+        arr[h - 1, :, :3],
+        arr[:, 0, :3],
+        arr[:, w - 1, :3],
+    ], axis=0).astype(np.float32)
+    bg_color = np.median(edge_pixels, axis=0)
+
+    # ── Máscara de similaridade com o fundo ────────────────────
+    rgb = arr[:, :, :3].astype(np.float32)
+    dist = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
+    similar = dist <= float(tolerance)
+
+    # ── Barreira de gradiente ───────────────────────────────────
+    # Pixels com grande variação de cor em relação aos vizinhos são bordas
+    # do design e bloqueiam o flood fill, protegendo as áreas internas.
+    gray = np.dot(rgb, np.array([0.299, 0.587, 0.114], dtype=np.float32))
+    edge_str = estimate_edge_strength(gray)
+    barrier = edge_str >= edge_barrier  # transição brusca = barreira
+
+    # Inundável = similar ao fundo E não é uma barreira de borda
+    floodable = similar & ~barrier
+
+    # ── Flood fill a partir das 4 bordas ───────────────────────
+    connected = np.zeros((h, w), dtype=bool)
+    connected[0, :]     |= floodable[0, :]
+    connected[h - 1, :] |= floodable[h - 1, :]
+    connected[:, 0]     |= floodable[:, 0]
+    connected[:, w - 1] |= floodable[:, w - 1]
+
+    changed = True
+    while changed:
+        prev = connected.copy()
+        exp = connected.copy()
+        exp[1:, :]  |= connected[:-1, :]
+        exp[:-1, :] |= connected[1:, :]
+        exp[:, 1:]  |= connected[:, :-1]
+        exp[:, :-1] |= connected[:, 1:]
+        connected = exp & floodable
+        changed = not np.array_equal(connected, prev)
+
+    result = arr.copy()
+    result[connected, 3] = 0
+
+    # ── Restaurar ilhas transparentes internas ──────────────────
+    # Pixels transparentes que NÃO estão conectados à borda da imagem
+    # são regiões internas que vazaram — restauramos com a cor original.
+    alpha_after = result[:, :, 3]
+    transparent = alpha_after == 0
+
+    border_connected = np.zeros((h, w), dtype=bool)
+    border_connected[0, :]     |= transparent[0, :]
+    border_connected[h - 1, :] |= transparent[h - 1, :]
+    border_connected[:, 0]     |= transparent[:, 0]
+    border_connected[:, w - 1] |= transparent[:, w - 1]
+
+    changed = True
+    while changed:
+        prev = border_connected.copy()
+        exp = border_connected.copy()
+        exp[1:, :]  |= border_connected[:-1, :]
+        exp[:-1, :] |= border_connected[1:, :]
+        exp[:, 1:]  |= border_connected[:, :-1]
+        exp[:, :-1] |= border_connected[:, 1:]
+        border_connected = exp & transparent
+        changed = not np.array_equal(border_connected, prev)
+
+    # Ilhas isoladas = transparentes mas NÃO conectadas à borda
+    isolated = transparent & ~border_connected
+    result[isolated, :] = arr[isolated, :]  # restaura cor + alpha originais
+
+    return sanitizar_rgb_transparente(Image.fromarray(result, "RGBA"))
+
+
 # ── App ──────────────────────────────────────────────────────
 class App(TK_ROOT):
     def __init__(self):
@@ -1057,6 +1157,7 @@ class App(TK_ROOT):
         self._brush_size = tk.IntVar(value=22)
         self._brush_shape = tk.StringVar(value="round")
         self._hair_protect = tk.BooleanVar(value=True)
+        self._sticker_mode = tk.BooleanVar(value=False)
         self._resize_enabled = tk.BooleanVar(value=False)
         self._resize_width = tk.StringVar(value="")
         self._resize_height = tk.StringVar(value="")
@@ -1495,28 +1596,29 @@ class App(TK_ROOT):
 
         self._white_slider_card = self._build_compact_slider(inner, "white_threshold", self._thr_main, 180, 255, 0)
         self._edge_slider_card = self._build_compact_slider(inner, "edge_cleanup", self._erode_ret, 0, 8, 1)
-        self._resize_card = self._build_resize_controls(inner, 2)
-        self._manual_card = self._build_manual_controls(inner, 3)
+        self._sticker_card = self._build_sticker_controls(inner, 2)
+        self._resize_card = self._build_resize_controls(inner, 3)
+        self._manual_card = self._build_manual_controls(inner, 4)
 
         self._btn_run = self._make_glow_button(inner, self._t("remove_bg"), self._start)
-        self._btn_run.grid(row=4, column=0, sticky="ew", pady=(22,12))
+        self._btn_run.grid(row=5, column=0, sticky="ew", pady=(22,12))
 
         self._btn_refine = self._mkbtn(
             inner, self._t("refine_edges"), self._apply_retouch,
             bg=CARD2, hover="#202938", pady=11, font=("Segoe UI",11,"bold")
         )
-        self._btn_refine.grid(row=5, column=0, sticky="ew", pady=(0,10))
+        self._btn_refine.grid(row=6, column=0, sticky="ew", pady=(0,10))
 
         self._btn_export = self._mkbtn(
             inner, self._t("export_file"), self._export_current,
             bg=CARD2, hover="#202938", pady=11, font=("Segoe UI",11,"bold")
         )
-        self._btn_export.grid(row=6, column=0, sticky="ew")
+        self._btn_export.grid(row=7, column=0, sticky="ew")
         self._btn_copy = self._mkbtn(
             inner, self._t("copy_image"), self._copy_current_to_clipboard,
             bg=CARD2, hover="#202938", pady=11, font=("Segoe UI",11,"bold")
         )
-        self._btn_copy.grid(row=7, column=0, sticky="ew", pady=(10,0))
+        self._btn_copy.grid(row=8, column=0, sticky="ew", pady=(10,0))
         self._btn_save = self._btn_export
 
         self._lbl_simple_note = tk.Label(
@@ -1524,8 +1626,8 @@ class App(TK_ROOT):
             text=self._t("simple_note"),
             font=("Segoe UI",9), bg=CARD, fg=MUTED, justify="left", wraplength=212
         )
-        self._lbl_simple_note.grid(row=8, column=0, sticky="ew", pady=(18,0), padx=(4,0))
-        tk.Frame(inner, bg=CARD, height=14).grid(row=9, column=0, sticky="ew")
+        self._lbl_simple_note.grid(row=9, column=0, sticky="ew", pady=(18,0), padx=(4,0))
+        tk.Frame(inner, bg=CARD, height=14).grid(row=10, column=0, sticky="ew")
 
         self._set_secondary_buttons_enabled(False)
         self._apply_controls_panel_layout()
@@ -1566,6 +1668,42 @@ class App(TK_ROOT):
         for widget in (top, lbl, toggle):
             widget.bind("<Button-1>", _toggle, add="+")
         self._apply_expandable_card_state(wrap)
+        return wrap
+
+    def _build_sticker_controls(self, parent, row):
+        wrap = tk.Frame(parent, bg=CARD2, padx=14, pady=10,
+                        highlightthickness=1, highlightbackground=BORDER)
+        wrap.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        wrap.columnconfigure(0, weight=1)
+
+        header = tk.Frame(wrap, bg=CARD2)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        self._lbl_sticker_title = tk.Label(
+            header, text=self._t("sticker_mode"),
+            font=("Segoe UI", 10, "bold"), bg=CARD2, fg=SOFT_TEXT
+        )
+        self._lbl_sticker_title.pack(side="left")
+
+        self._chk_sticker = tk.Checkbutton(
+            header,
+            variable=self._sticker_mode,
+            bg=CARD2, fg=TEXT,
+            selectcolor=CARD2,
+            activebackground=CARD2,
+            activeforeground=TEXT,
+            highlightthickness=0, bd=0,
+        )
+        self._chk_sticker.pack(side="right")
+
+        self._lbl_sticker_sub = tk.Label(
+            wrap, text=self._t("sticker_mode_sub"),
+            font=("Segoe UI", 8), bg=CARD2, fg=MUTED,
+            justify="left", wraplength=172, anchor="w"
+        )
+        self._lbl_sticker_sub.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
         return wrap
 
     def _build_resize_controls(self, parent, row):
@@ -1657,6 +1795,16 @@ class App(TK_ROOT):
             bg=CARD2, fg=MUTED
         )
         self._lbl_resize_lock.grid(row=5, column=0, columnspan=2, sticky="w", padx=(46,0), pady=(10,0), in_=card._body)
+
+        # Separador
+        tk.Frame(card._body, bg=BORDER, height=1).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14,0))
+
+        # Botão exportar original redimensionado
+        self._btn_export_resized_orig = self._mkbtn(
+            card._body, self._t("export_resized_original"), self._export_original_resized,
+            bg=CARD, hover="#202938", pady=8, font=("Segoe UI", 9, "bold")
+        )
+        self._btn_export_resized_orig.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         card._body.grid(row=1, column=0, columnspan=2, sticky="ew")
         for widget in (header, self._lbl_resize_title, card._toggle_label):
@@ -2441,6 +2589,9 @@ class App(TK_ROOT):
         self._lbl_controls_sub.config(wraplength=212)
         for key, lbl in self._slider_label_refs.items():
             lbl.config(text=self._t(key))
+        if hasattr(self, "_lbl_sticker_title"):
+            self._lbl_sticker_title.config(text=self._t("sticker_mode"))
+            self._lbl_sticker_sub.config(text=self._t("sticker_mode_sub"), wraplength=172)
         if hasattr(self, "_lbl_resize_title"):
             self._lbl_resize_title.config(text=self._t("output_size"))
             self._lbl_resize_sub.config(text=self._t("output_size_sub"), wraplength=160)
@@ -2449,6 +2600,8 @@ class App(TK_ROOT):
             self._lbl_resize_height.config(text=self._t("height_label"))
             self._lbl_resize_lock.config(text=self._t("lock_ratio"))
             self._update_original_dimensions_label()
+        if hasattr(self, "_btn_export_resized_orig"):
+            self._btn_export_resized_orig.config(text=self._t("export_resized_original"))
         if hasattr(self, "_lbl_manual_title"):
             self._lbl_manual_title.config(text=self._t("manual_tools"))
             self._lbl_manual_sub.config(text=self._t("manual_tools_sub_short"), wraplength=160)
@@ -2494,6 +2647,7 @@ class App(TK_ROOT):
         simple = self._modo_simples.get()
         toggle_pairs = (
             (self._edge_slider_card, not simple),
+            (self._sticker_card, not simple),
             (self._resize_card, not simple),
             (self._manual_card, not simple),
             (self._btn_refine, not simple),
@@ -3477,6 +3631,8 @@ class App(TK_ROOT):
                 entry.config(state="normal" if active else "disabled")
         if hasattr(self, "_btn_resize_lock"):
             self._set_button_enabled(self._btn_resize_lock, active)
+        if hasattr(self, "_btn_export_resized_orig"):
+            self._set_button_enabled(self._btn_export_resized_orig, active)
 
     def _update_original_dimensions_label(self):
         if not hasattr(self, "_lbl_resize_orig"):
@@ -3500,7 +3656,10 @@ class App(TK_ROOT):
         self._orig_width = width
         self._orig_height = height
         self._update_original_dimensions_label()
-        self._set_resize_fields(width, height)
+        # Só preenche automaticamente se o resize NÃO estiver ativo com valores do usuário
+        # (evita resetar dimensões personalizadas ao re-processar a imagem)
+        if not self._resize_enabled.get():
+            self._set_resize_fields(width, height)
         self._update_resize_controls_state()
 
     def _clear_original_dimensions(self):
@@ -3672,6 +3831,11 @@ class App(TK_ROOT):
 
     def _process_one(self, data: bytes, matting: bool, thr: int) -> Image.Image:
         src = Image.open(io.BytesIO(data)).convert("RGB")
+
+        # Modo Sticker: flood fill remove apenas o fundo externo, sem usar IA
+        if self._sticker_mode.get():
+            return remover_fundo_sticker(src)
+
         bg_rgb = estimate_background_color(src)
         bg_brightness = float(np.mean(bg_rgb))
         artwork_mode = is_artwork_like_image(src, bg_rgb)
@@ -3856,6 +4020,48 @@ class App(TK_ROOT):
 
         final_img.save(str(dest), spec["pil_format"], **save_kwargs)
         return dest, final_img
+
+    def _export_original_resized(self):
+        """Exporta a imagem ORIGINAL redimensionada, sem remover fundo."""
+        if self._sel is None or self._sel >= len(self._files):
+            messagebox.showinfo(self._t("nothing_selected_title"), self._t("nothing_selected_msg"))
+            return
+        out_w, out_h = self._get_resize_dimensions()
+        if not out_w or not out_h:
+            messagebox.showinfo(
+                self._t("nothing_selected_title"),
+                "Enable 'Resize on export' and set width/height first."
+                if self._lang == "en" else
+                "Ative 'Redimensionar ao exportar' e defina largura/altura primeiro."
+            )
+            return
+        path = self._files[self._sel]
+        try:
+            original = Image.open(path)
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+
+        p = Path(path)
+        spec = EXPORT_FORMATS.get(self._export_format_key, EXPORT_FORMATS["png"])
+        dest = (Path(self._out_dir) if self._out_dir else p.parent) / (p.stem + f"_{out_w}x{out_h}" + spec["ext"])
+
+        resized = resize_to_dimensions(original.convert("RGBA" if spec["transparent"] else "RGB"), out_w, out_h)
+        final_img = prepare_export_image(resized, spec["transparent"])
+
+        save_kwargs = {}
+        if spec["pil_format"] == "WEBP":
+            save_kwargs.update({"quality": 95, "method": 6})
+        elif spec["pil_format"] == "JPEG":
+            save_kwargs.update({"quality": 95, "subsampling": 0})
+
+        final_img.save(str(dest), spec["pil_format"], **save_kwargs)
+        self._set_status(
+            self._t("exported_status", name=dest.name,
+                    size=f"{final_img.width}×{final_img.height}px",
+                    folder=dest.parent),
+            SUCCESS
+        )
 
     def _export_current(self):
         if self._sel is None: return
