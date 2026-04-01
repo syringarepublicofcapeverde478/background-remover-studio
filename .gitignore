@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Auto-generated shortcut with custom icon (created by start.vbs on first run)
+*.lnk
+
+# App outputs — never commit processed images
+*_sem_fundo.png
+*_no_bg.png
+output/
+exports/
+
+# Model cache (large, downloaded at runtime)
+.u2net/

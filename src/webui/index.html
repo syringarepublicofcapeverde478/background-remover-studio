@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Background Remover Studio Web</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">LOCAL WEB STUDIO</p>
+          <h1>Remove Background</h1>
+          <p class="sub">Python backend, modern web interface, premium local workflow.</p>
+        </div>
+        <div class="hero-actions">
+          <span class="badge">FastAPI</span>
+          <span class="badge">rembg</span>
+          <span class="badge">Local</span>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="sidebar card">
+          <div class="section-head">
+            <div>
+              <h2>Your Images</h2>
+              <p>Drop files or browse from your computer.</p>
+            </div>
+          </div>
+
+          <label class="dropzone" id="dropzone">
+            <input id="fileInput" type="file" accept="image/*" multiple hidden />
+            <span class="drop-icon">+</span>
+            <strong>Drop images here</strong>
+            <span>or click to browse</span>
+          </label>
+
+          <div id="queue" class="queue"></div>
+        </aside>
+
+        <section class="preview card">
+          <div class="section-head">
+            <div>
+              <h2>Preview</h2>
+              <p>Original and processed output side by side.</p>
+            </div>
+            <div class="preview-meta">
+              <span id="resolutionText">No image selected</span>
+            </div>
+          </div>
+
+          <div class="preview-grid">
+            <div class="preview-card">
+              <div class="preview-label">ORIGINAL</div>
+              <div class="checker">
+                <img id="originalPreview" alt="Original preview" />
+                <div id="originalEmpty" class="empty-state">No image selected</div>
+              </div>
+            </div>
+            <div class="preview-card">
+              <div class="preview-label">BACKGROUND REMOVED</div>
+              <div class="checker">
+                <img id="resultPreview" alt="Processed preview" />
+                <div id="resultEmpty" class="empty-state">Not processed yet</div>
+                <div id="loadingOverlay" class="loading-overlay hidden">
+                  <div class="spinner"></div>
+                  <span>Removing background...</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="controls card">
+          <div class="section-head">
+            <div>
+              <h2>Adjustments</h2>
+              <p>Fine tune the cutout before exporting.</p>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>White Threshold</span>
+            <output id="thresholdValue">225</output>
+          </label>
+          <input id="threshold" type="range" min="180" max="255" value="225" />
+
+          <label class="field">
+            <span>Edge Cleanup</span>
+            <output id="edgeValue">0</output>
+          </label>
+          <input id="edgeCleanup" type="range" min="0" max="8" value="0" />
+
+          <label class="toggle-row">
+            <input id="hairProtect" type="checkbox" checked />
+            <span>Hair Protect</span>
+          </label>
+
+          <label class="field">
+            <span>Export Format</span>
+          </label>
+          <select id="exportFormat">
+            <option value="png">PNG transparent</option>
+            <option value="webp">WebP transparent</option>
+            <option value="jpg">JPG white background</option>
+          </select>
+
+          <button id="removeButton" class="primary-button">Remove Background</button>
+          <button id="downloadButton" class="secondary-button" disabled>Download Result</button>
+          <button id="copyButton" class="secondary-button" disabled>Copy Image</button>
+        </aside>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

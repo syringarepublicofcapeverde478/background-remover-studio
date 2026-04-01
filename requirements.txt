@@ -1,0 +1,7 @@
+numpy
+pillow
+rembg[cpu]
+tkinterdnd2
+fastapi
+uvicorn
+python-multipart
