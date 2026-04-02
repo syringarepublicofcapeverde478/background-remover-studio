@@ -105,6 +105,12 @@ I18N = {
         "hair_protect_sub": "Preserve fine strands and trim loose background near hair.",
         "sticker_mode": "Sticker Mode",
         "sticker_mode_sub": "Flood-fill removes only the outer background. Keeps white areas inside the design intact.",
+        "bg_colors_title": "Background Colors",
+        "bg_colors_sub": "Auto-detected colors to remove. Click a swatch to keep that color.",
+        "color_tolerance": "Tolerance",
+        "spill_suppress": "Decontaminate Edges",
+        "reapply_colors": "Re-apply Color Filter",
+        "color_filter_done": "Color filter re-applied.",
         "export_resized_original": "Export Resized Original",
         "export_resized_original_sub": "Saves the original image at the chosen dimensions, without removing the background.",
         "toggle_adjustments_hide": "Hide Adjustments",
@@ -232,6 +238,12 @@ I18N = {
         "hair_protect_sub": "Preserva fios finos e corta restos soltos perto do cabelo.",
         "sticker_mode": "Modo Sticker",
         "sticker_mode_sub": "Flood fill remove apenas o fundo externo. Preserva áreas brancas internas do design.",
+        "bg_colors_title": "Cores do Fundo",
+        "bg_colors_sub": "Cores detectadas automaticamente. Clique numa amostra para manter aquela cor.",
+        "color_tolerance": "Tolerância",
+        "spill_suppress": "Descontaminar Bordas",
+        "reapply_colors": "Reaplicar Filtro de Cores",
+        "color_filter_done": "Filtro de cores reaplicado.",
         "export_resized_original": "Exportar Original Redimensionado",
         "export_resized_original_sub": "Salva a imagem original nas dimensões escolhidas, sem remover o fundo.",
         "toggle_adjustments_hide": "Ocultar Ajustes",
@@ -1022,6 +1034,188 @@ def processing_profile(width: int, height: int, threshold: int):
     return erode_size, clean_threshold, edge_radius
 
 
+def sugerir_limiar_branco(img: Image.Image) -> int:
+    """Analisa o fundo da imagem e retorna o limiar de branco ideal para a pipeline.
+
+    Lógica:
+    - Fundo muito escuro          → 252  (sem bordas brancas para limpar)
+    - Fundo colorido saturado     → 245  (o filtro de cor cuida; branco é irrelevante)
+    - Fundo cinza médio           → 230  (limpeza moderada)
+    - Fundo quase-branco / branco → 212–225  (limpeza agressiva de halos)
+    """
+    bg_rgb = estimate_background_color(img)
+    bg_brightness = float(np.mean(bg_rgb))
+    bg_saturation = float(np.max(bg_rgb) - np.min(bg_rgb))
+
+    if bg_brightness < 60:
+        return 252                                     # fundo escuro
+    if bg_saturation > 65:
+        return 245                                     # fundo colorido saturado
+    if bg_brightness > 225:
+        # Branco puro → limiar mais baixo para pegar halos
+        return max(210, int(255 - (bg_brightness - 205) * 2.0))
+    # Escala linear entre cinza médio e quase-branco
+    return int(248 - (bg_brightness - 60) * 0.12)
+
+
+def detectar_paleta_fundo(img: Image.Image, n_colors: int = 5) -> list:
+    """Detecta as cores dominantes do fundo usando APENAS os pixels mais externos da borda.
+
+    Usa somente as 4 fileiras mais externas (não 24px) para evitar capturar
+    cabelo, roupa ou pele do sujeito que esteja próximo à borda.
+    Em seguida filtra outliers: mantém apenas pixels dentro de ±45 da mediana
+    da borda (exclui pixels isolados do sujeito que vazaram para a borda).
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+    # Borda muito fina — apenas pixels claramente de fundo
+    border_px = max(3, min(5, h // 25, w // 25))
+    pieces = [
+        arr[:border_px, :].reshape(-1, 3),
+        arr[h - border_px:, :].reshape(-1, 3),
+        arr[:, :border_px].reshape(-1, 3),
+        arr[:, w - border_px:].reshape(-1, 3),
+    ]
+    pixels = np.concatenate(pieces, axis=0).astype(np.float32)
+    if len(pixels) == 0:
+        return []
+
+    # Filtra outliers: mantém apenas pixels próximos à cor mediana da borda.
+    # Isso remove pixels de cabelo/roupa que aparecem na extremidade da imagem.
+    median_color = np.median(pixels, axis=0)
+    dist_from_median = np.sqrt(np.sum((pixels - median_color) ** 2, axis=1))
+    thr = max(float(np.percentile(dist_from_median, 70)), 20.0)
+    thr = min(thr, 55.0)   # nunca mais de 55 — força a cluster ficar apertado
+    filtered = pixels[dist_from_median <= thr]
+    if len(filtered) < 8:
+        filtered = pixels   # fallback se filtragem for demasiado agressiva
+
+    n = min(n_colors, len(filtered))
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(filtered), n, replace=False)
+    centers = filtered[idx].copy()
+
+    for _ in range(40):
+        diffs = filtered[:, None, :] - centers[None, :, :]
+        labels = np.argmin(np.sum(diffs ** 2, axis=2), axis=1)
+        new_centers = np.array([
+            filtered[labels == k].mean(axis=0) if (labels == k).any() else centers[k]
+            for k in range(n)
+        ])
+        if np.allclose(centers, new_centers, atol=0.5):
+            break
+        centers = new_centers
+
+    counts = np.bincount(labels, minlength=n)
+    order = np.argsort(-counts)
+    return [
+        (int(np.clip(centers[k, 0], 0, 255)),
+         int(np.clip(centers[k, 1], 0, 255)),
+         int(np.clip(centers[k, 2], 0, 255)))
+        for k in order if counts[k] > 0
+    ][:n_colors]
+
+
+def aplicar_color_key(result_rgba: Image.Image, src_rgb: Image.Image,
+                      bg_colors: list, tolerance: int = 35,
+                      suppress_spill: bool = True) -> Image.Image:
+    """Pós-processamento: apaga pixels residuais que correspondam a cores de fundo conhecidas.
+
+    Usa a imagem ORIGINAL (src_rgb) como referência de cor — não o resultado —
+    para identificar com precisão quais pixels eram fundo.
+    """
+    if not bg_colors:
+        return result_rgba
+
+    arr_r = np.array(result_rgba.convert("RGBA"), dtype=np.float32)
+    arr_o = np.array(src_rgb.convert("RGB"), dtype=np.float32)
+    tol = float(max(tolerance, 1))
+
+    # Máscara de pixels semi-transparentes: rembg já os marcou como "borda de transição".
+    # Pixels TOTALMENTE opacos (alpha >= 215) são provavelmente sujeito real (roupa, pele)
+    # e só devem ser tocados pelo blob-cleanup com condições muito restritas.
+    semi_only = arr_r[:, :, 3] < 215   # proteção: não toca totalmente opacos
+
+    for (cr, cg, cb) in bg_colors:
+        c = np.array([cr, cg, cb], dtype=np.float32)
+        dist = np.sqrt(np.sum((arr_o - c) ** 2, axis=2))
+
+        # Remoção dura — apenas pixels JÁ semi-transparentes perto do fundo
+        hard = (dist <= tol * 0.55) & (arr_r[:, :, 3] > 20) & semi_only
+        arr_r[hard, 3] = 0.0
+
+        # Transição suave — idem, apenas semi-transparentes
+        soft = (dist > tol * 0.55) & (dist <= tol) & (arr_r[:, :, 3] > 20) & semi_only
+        if soft.any():
+            ratio = (dist[soft] - tol * 0.55) / (tol * 0.45 + 1e-6)
+            ratio = np.clip(ratio, 0.0, 1.0)
+            arr_r[soft, 3] = np.minimum(arr_r[soft, 3], ratio * 255.0)
+
+        # Supressão de spill: decontamina pixels semitransparentes com tinta do fundo
+        if suppress_spill:
+            semi = (arr_r[:, :, 3] > 8) & (arr_r[:, :, 3] < 210)
+            if semi.any():
+                sy, sx = np.where(semi)
+                dist_s = np.sqrt(np.sum((arr_o[sy, sx] - c) ** 2, axis=1))
+                close = dist_s < tol * 1.6
+                if close.any():
+                    ky, kx = sy[close], sx[close]
+                    alpha_k = arr_r[ky, kx, 3] / 255.0
+                    contamination = np.clip(1.0 - alpha_k, 0.0, 0.88) * 0.60
+                    decontam = arr_r[ky, kx, :3] - c * contamination[:, None]
+                    arr_r[ky, kx, :3] = np.clip(decontam, 0.0, 255.0)
+
+    # ── Blob cleanup: pixels opacos de borda com cor de fundo no original ─────────────────
+    # Única situação onde tocamos pixels opacos: estão completamente encostados em
+    # transparent (≥3 vizinhos transparentes) E a cor original era muito próxima do fundo.
+    alpha_now = arr_r[:, :, 3]
+    transparent_now = alpha_now < 30
+    trans_pad = np.pad(transparent_now.astype(np.uint8), 1, mode='constant')
+    neighbors_transparent = (
+        trans_pad[:-2, 1:-1] + trans_pad[2:, 1:-1] +
+        trans_pad[1:-1, :-2] + trans_pad[1:-1, 2:]
+    )
+    for (cr, cg, cb) in bg_colors:
+        c = np.array([cr, cg, cb], dtype=np.float32)
+        dist_o = np.sqrt(np.sum((arr_o - c) ** 2, axis=2))
+        # Exige 3+ vizinhos transparentes (mais restritivo) para pixels totalmente opacos
+        residue = (alpha_now > 60) & (dist_o <= tol * 0.85) & (neighbors_transparent >= 3)
+        arr_r[residue, 3] = 0.0
+
+    # ── Erosão iterativa da franja — apenas pixels SEMI-TRANSPARENTES de borda ───────────
+    # A franja residual ao redor do cabelo é semi-transparente (rembg já a marcou assim).
+    # Verificamos a cor do RESULTADO (não original) porque esses pixels continuam
+    # visivelmente cor-de-fundo mesmo depois dos passes anteriores.
+    # Restringindo a alpha < 215 garantimos que roupa e pele opacos nunca são tocados.
+    tol_result = max(tol * 1.45, 55.0)
+    for _ in range(6):          # 6 passes são suficientes para a franja típica
+        alpha_iter = arr_r[:, :, 3]
+        transp_iter = alpha_iter < 25
+
+        tp = np.pad(transp_iter.astype(np.uint8), 1, mode='constant')
+        near_transp = (
+            tp[:-2, 1:-1] + tp[2:, 1:-1] + tp[1:-1, :-2] + tp[1:-1, 2:]
+        ) > 0
+
+        removed_any = False
+        for (cr, cg, cb) in bg_colors:
+            c = np.array([cr, cg, cb], dtype=np.float32)
+            dist_result = np.sqrt(np.sum((arr_r[:, :, :3] - c) ** 2, axis=2))
+            # Somente semi-transparentes na borda — NUNCA pixels totalmente opacos
+            remove = (near_transp & (dist_result <= tol_result)
+                      & (arr_r[:, :, 3] > 15) & (arr_r[:, :, 3] < 215))
+            if remove.any():
+                arr_r[remove, 3] = 0.0
+                removed_any = True
+
+        if not removed_any:
+            break
+
+    return sanitizar_rgb_transparente(
+        Image.fromarray(np.clip(arr_r, 0, 255).astype(np.uint8), "RGBA")
+    )
+
+
 def remover_fundo_sticker(img: Image.Image, tolerance: int = 35, edge_barrier: float = 20.0) -> Image.Image:
     """
     Remove apenas o fundo EXTERNO usando flood fill morfológico com barreira de gradiente.
@@ -1158,6 +1352,9 @@ class App(TK_ROOT):
         self._brush_shape = tk.StringVar(value="round")
         self._hair_protect = tk.BooleanVar(value=True)
         self._sticker_mode = tk.BooleanVar(value=False)
+        self._color_key_tol = tk.IntVar(value=35)
+        self._spill_suppress = tk.BooleanVar(value=True)
+        self._detected_colors: list = []          # (r,g,b) tuples from last detection
         self._resize_enabled = tk.BooleanVar(value=False)
         self._resize_width = tk.StringVar(value="")
         self._resize_height = tk.StringVar(value="")
@@ -1499,6 +1696,11 @@ class App(TK_ROOT):
                                            bg=CARD2, hover="#202938", pady=7,
                                            font=("Segoe UI",10,"bold"))
         self._btn_view_split.pack(side="left")
+        tk.Frame(mode_row, bg=CARD, width=16).pack(side="left")
+        self._btn_undo_preview = self._mkbtn(mode_row, "↩", self._undo_manual_edit,
+                                             bg=CARD2, hover="#202938", pady=7,
+                                             font=("Segoe UI",10,"bold"))
+        self._btn_undo_preview.pack(side="left")
 
         zoom_bar = tk.Frame(mode_row, bg=CARD)
         zoom_bar.pack(side="right")
@@ -1595,30 +1797,31 @@ class App(TK_ROOT):
         inner.bind("<Leave>", lambda _e: self._set_mousewheel_target(None))
 
         self._white_slider_card = self._build_compact_slider(inner, "white_threshold", self._thr_main, 180, 255, 0)
-        self._edge_slider_card = self._build_compact_slider(inner, "edge_cleanup", self._erode_ret, 0, 8, 1)
-        self._sticker_card = self._build_sticker_controls(inner, 2)
-        self._resize_card = self._build_resize_controls(inner, 3)
-        self._manual_card = self._build_manual_controls(inner, 4)
+        self._color_card = self._build_color_detect_card(inner, 1)
+        self._edge_slider_card = self._build_compact_slider(inner, "edge_cleanup", self._erode_ret, 0, 8, 2)
+        self._sticker_card = self._build_sticker_controls(inner, 3)
+        self._resize_card = self._build_resize_controls(inner, 4)
+        self._manual_card = self._build_manual_controls(inner, 5)
 
         self._btn_run = self._make_glow_button(inner, self._t("remove_bg"), self._start)
-        self._btn_run.grid(row=5, column=0, sticky="ew", pady=(22,12))
+        self._btn_run.grid(row=6, column=0, sticky="ew", pady=(22,12))
 
         self._btn_refine = self._mkbtn(
             inner, self._t("refine_edges"), self._apply_retouch,
             bg=CARD2, hover="#202938", pady=11, font=("Segoe UI",11,"bold")
         )
-        self._btn_refine.grid(row=6, column=0, sticky="ew", pady=(0,10))
+        self._btn_refine.grid(row=7, column=0, sticky="ew", pady=(0,10))
 
         self._btn_export = self._mkbtn(
             inner, self._t("export_file"), self._export_current,
             bg=CARD2, hover="#202938", pady=11, font=("Segoe UI",11,"bold")
         )
-        self._btn_export.grid(row=7, column=0, sticky="ew")
+        self._btn_export.grid(row=8, column=0, sticky="ew")
         self._btn_copy = self._mkbtn(
             inner, self._t("copy_image"), self._copy_current_to_clipboard,
             bg=CARD2, hover="#202938", pady=11, font=("Segoe UI",11,"bold")
         )
-        self._btn_copy.grid(row=8, column=0, sticky="ew", pady=(10,0))
+        self._btn_copy.grid(row=9, column=0, sticky="ew", pady=(10,0))
         self._btn_save = self._btn_export
 
         self._lbl_simple_note = tk.Label(
@@ -1626,8 +1829,8 @@ class App(TK_ROOT):
             text=self._t("simple_note"),
             font=("Segoe UI",9), bg=CARD, fg=MUTED, justify="left", wraplength=212
         )
-        self._lbl_simple_note.grid(row=9, column=0, sticky="ew", pady=(18,0), padx=(4,0))
-        tk.Frame(inner, bg=CARD, height=14).grid(row=10, column=0, sticky="ew")
+        self._lbl_simple_note.grid(row=10, column=0, sticky="ew", pady=(18,0), padx=(4,0))
+        tk.Frame(inner, bg=CARD, height=14).grid(row=11, column=0, sticky="ew")
 
         self._set_secondary_buttons_enabled(False)
         self._apply_controls_panel_layout()
@@ -1669,6 +1872,228 @@ class App(TK_ROOT):
             widget.bind("<Button-1>", _toggle, add="+")
         self._apply_expandable_card_state(wrap)
         return wrap
+
+    def _build_color_detect_card(self, parent, row):
+        """Card com amostras de cores detectadas do fundo + controles de filtro de cor."""
+        card = tk.Frame(parent, bg=CARD2, padx=14, pady=10,
+                        highlightthickness=1, highlightbackground=BORDER)
+        card.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        card.columnconfigure(0, weight=1)
+
+        # ── Cabeçalho ──────────────────────────────────────────────────
+        header = tk.Frame(card, bg=CARD2)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        self._lbl_color_title = tk.Label(
+            header, text=self._t("bg_colors_title"),
+            font=("Segoe UI", 10), bg=CARD2, fg=SOFT_TEXT
+        )
+        self._lbl_color_title.pack(side="left")
+
+        self._btn_refresh_colors = self._mkbtn(
+            header, "⟳", self._refresh_color_swatches,
+            bg=CARD2, hover="#202938", pady=1, padx=6, font=("Segoe UI", 11)
+        )
+        self._btn_refresh_colors.pack(side="right")
+
+        self._lbl_color_sub = tk.Label(
+            card, text=self._t("bg_colors_sub"),
+            font=("Segoe UI", 8), bg=CARD2, fg=MUTED,
+            justify="left", wraplength=180, anchor="w"
+        )
+        self._lbl_color_sub.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        # ── Swatches ───────────────────────────────────────────────────
+        swatch_row = tk.Frame(card, bg=CARD2)
+        swatch_row.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+        self._color_swatches = []
+        for i in range(5):
+            sw = tk.Frame(swatch_row, width=30, height=30, bg="#1a2233",
+                          highlightthickness=2, highlightbackground="#333344",
+                          cursor="hand2")
+            sw.pack(side="left", padx=(0, 6))
+            sw.pack_propagate(False)
+            sw._active = False    # True = this color WILL be removed
+            sw._color  = None     # (r, g, b) or None if empty slot
+            sw._index  = i
+            sw.bind("<Button-1>", lambda _e, s=sw: self._toggle_color_swatch(s))
+            self._color_swatches.append(sw)
+
+        # ── Corpo avançado (oculto em Modo Simples) ────────────────────
+        body = tk.Frame(card, bg=CARD2)
+        body.columnconfigure(1, weight=1)
+        card._color_body = body
+
+        # Tolerância
+        self._lbl_color_tolerance = tk.Label(body, text=self._t("color_tolerance"),
+                                              font=("Segoe UI", 9), bg=CARD2, fg=SOFT_TEXT)
+        self._lbl_color_tolerance.grid(row=0, column=0, sticky="w", pady=(10, 0))
+        tk.Label(body, textvariable=self._color_key_tol,
+                 font=("Segoe UI", 9, "bold"), bg=CARD2, fg=TEXT).grid(
+            row=0, column=2, sticky="e", padx=(6, 0), pady=(10, 0))
+        tk.Scale(body, variable=self._color_key_tol, from_=10, to=100,
+                 orient="horizontal", bg=CARD2, fg=TEXT,
+                 highlightthickness=0, troughcolor="#243041",
+                 activebackground=ACCENT, sliderrelief="flat", bd=0,
+                 showvalue=0).grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=(10, 0))
+
+        # Supressão de spill
+        spill_row = tk.Frame(body, bg=CARD2)
+        spill_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self._lbl_spill = tk.Label(spill_row, text=self._t("spill_suppress"),
+                                   font=("Segoe UI", 9), bg=CARD2, fg=SOFT_TEXT)
+        self._lbl_spill.pack(side="left")
+        tk.Checkbutton(spill_row, variable=self._spill_suppress,
+                       bg=CARD2, fg=TEXT, selectcolor=CARD2,
+                       activebackground=CARD2, activeforeground=TEXT,
+                       highlightthickness=0, bd=0).pack(side="right")
+
+        # Botões re-aplicar + desfazer (lado a lado)
+        btn_row = tk.Frame(body, bg=CARD2)
+        btn_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        btn_row.columnconfigure(0, weight=1)
+
+        self._btn_reapply_colors = self._mkbtn(
+            btn_row, self._t("reapply_colors"), self._apply_color_key_pass,
+            bg=CARD2, hover="#202938", pady=8, font=("Segoe UI", 10, "bold")
+        )
+        self._btn_reapply_colors.grid(row=0, column=0, sticky="ew")
+
+        self._btn_undo_color = self._mkbtn(
+            btn_row, "↩", self._undo_manual_edit,
+            bg=CARD2, hover="#202938", pady=8, padx=10, font=("Segoe UI", 11)
+        )
+        self._btn_undo_color.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        body.grid(row=3, column=0, sticky="ew")
+        return card
+
+    def _toggle_color_swatch(self, swatch):
+        """Alterna o estado ativo de uma amostra de cor (ativa = será removida)."""
+        if swatch._color is None:
+            return
+        swatch._active = not swatch._active
+        if swatch._active:
+            swatch.config(highlightbackground=ACCENT, highlightthickness=2)
+        else:
+            # Dim border when excluded from removal
+            swatch.config(highlightbackground="#444455", highlightthickness=2)
+            # Overlay dark tint to signal "excluded"
+            r, g, b = swatch._color
+            # Blend towards dark to signal disabled
+            dr = int(r * 0.35)
+            dg = int(g * 0.35)
+            db = int(b * 0.35)
+            swatch.config(bg=f"#{dr:02x}{dg:02x}{db:02x}")
+        # Restore full color when active
+        if swatch._active and swatch._color:
+            r, g, b = swatch._color
+            swatch.config(bg=f"#{r:02x}{g:02x}{b:02x}")
+
+    def _update_color_swatches(self, img: "Image.Image"):
+        """Detecta as cores do fundo, sugere limiar de branco e atualiza as amostras na UI."""
+        if not hasattr(self, "_color_swatches"):
+            return
+        try:
+            colors = detectar_paleta_fundo(img, n_colors=5)
+        except Exception:
+            colors = []
+        self._detected_colors = colors
+
+        # Auto-sugere o limiar de branco ideal para este fundo
+        try:
+            suggested_thr = sugerir_limiar_branco(img)
+            self._thr_main.set(suggested_thr)
+        except Exception:
+            pass
+
+        # Auto-ajusta tolerância do filtro de cor com base na saturação do fundo.
+        # Fundo colorido saturado (amarelo, laranja, verde…) gera franjas mais distantes
+        # da cor pura detectada, então precisa de tolerância maior para a erosão funcionar.
+        try:
+            bg_rgb = estimate_background_color(img)
+            bg_sat = float(np.max(bg_rgb) - np.min(bg_rgb))
+            bg_bri = float(np.mean(bg_rgb))
+            if bg_sat > 80:                          # fundo colorido saturado
+                self._color_key_tol.set(50)
+            elif bg_sat > 40:                        # fundo levemente saturado
+                self._color_key_tol.set(55)
+            elif bg_bri > 210:                       # fundo muito claro/branco
+                self._color_key_tol.set(45)
+            else:                                    # fundo escuro ou neutro
+                self._color_key_tol.set(30)
+        except Exception:
+            pass
+
+        for i, sw in enumerate(self._color_swatches):
+            if i < len(colors):
+                r, g, b = colors[i]
+                sw._color = (r, g, b)
+                sw._active = True
+                sw.config(bg=f"#{r:02x}{g:02x}{b:02x}",
+                          highlightbackground=ACCENT,
+                          highlightthickness=2, cursor="hand2")
+            else:
+                sw._color = None
+                sw._active = False
+                sw.config(bg="#1a2233", highlightbackground="#333344",
+                          highlightthickness=2, cursor="arrow")
+
+    def _refresh_color_swatches(self):
+        """Re-detecta cores do fundo a partir da imagem selecionada atual."""
+        if self._sel is None or self._sel >= len(self._files):
+            return
+        try:
+            img = Image.open(self._files[self._sel])
+            self._update_color_swatches(img)
+        except Exception:
+            pass
+
+    def _get_active_removal_colors(self) -> list:
+        """Retorna lista de (r,g,b) para cores ativas (marcadas para remoção)."""
+        if not hasattr(self, "_color_swatches"):
+            return []
+        return [sw._color for sw in self._color_swatches
+                if sw._active and sw._color is not None]
+
+    def _apply_color_key_pass(self):
+        """Re-aplica apenas o filtro de cores ao resultado existente (sem reprocessar)."""
+        if self._sel is None or self._sel >= len(self._files):
+            return
+        path = self._files[self._sel]
+        base = self._retouched.get(path) or self._results.get(path)
+        if base is None:
+            return
+        active = self._get_active_removal_colors()
+        if not active:
+            return
+        try:
+            src = Image.open(path).convert("RGB")
+            result = aplicar_color_key(
+                base, src, active,
+                tolerance=self._color_key_tol.get(),
+                suppress_spill=self._spill_suppress.get()
+            )
+            # Salva estado ANTES de aplicar no histórico (permite Desfazer)
+            if path not in self._manual_history:
+                self._reset_history(path, base)
+            else:
+                self._push_history_snapshot(path, base)
+
+            self._results[path] = result
+            self._retouched.pop(path, None)
+            # Salva novo estado no histórico
+            self._push_history_snapshot(path, result)
+
+            self.after(0, lambda: (
+                self._set_card(self._card_a, result),
+                self._set_status(self._t("color_filter_done"), SUCCESS),
+                self._set_secondary_buttons_enabled(True),
+            ))
+        except Exception as e:
+            print(f"Color key pass error: {e}")
 
     def _build_sticker_controls(self, parent, row):
         wrap = tk.Frame(parent, bg=CARD2, padx=14, pady=10,
@@ -2589,6 +3014,12 @@ class App(TK_ROOT):
         self._lbl_controls_sub.config(wraplength=212)
         for key, lbl in self._slider_label_refs.items():
             lbl.config(text=self._t(key))
+        if hasattr(self, "_lbl_color_title"):
+            self._lbl_color_title.config(text=self._t("bg_colors_title"))
+            self._lbl_color_sub.config(text=self._t("bg_colors_sub"), wraplength=180)
+            self._lbl_color_tolerance.config(text=self._t("color_tolerance"))
+            self._lbl_spill.config(text=self._t("spill_suppress"))
+            self._btn_reapply_colors.config(text=self._t("reapply_colors"))
         if hasattr(self, "_lbl_sticker_title"):
             self._lbl_sticker_title.config(text=self._t("sticker_mode"))
             self._lbl_sticker_sub.config(text=self._t("sticker_mode_sub"), wraplength=172)
@@ -2653,6 +3084,12 @@ class App(TK_ROOT):
             (self._btn_refine, not simple),
             (self._lbl_simple_note, simple),
         )
+        # Em Modo Simples: oculta controles avançados do filtro de cores (slider + spill + re-apply)
+        if hasattr(self, "_color_card") and hasattr(self._color_card, "_color_body"):
+            if simple:
+                self._color_card._color_body.grid_remove()
+            else:
+                self._color_card._color_body.grid()
         for widget, show in toggle_pairs:
             if show:
                 widget.grid()
@@ -3769,6 +4206,8 @@ class App(TK_ROOT):
             self._manual_original_path = path
             self._manual_original_rgba = img.convert("RGBA")
             self._refresh_selected_info()
+            # Detecta cores do fundo e atualiza amostras em idle (não bloqueia a UI)
+            self.after_idle(lambda i=img.copy(): self._update_color_swatches(i))
         except Exception: pass
 
         result = self._retouched.get(path) or self._results.get(path)
@@ -3877,7 +4316,17 @@ class App(TK_ROOT):
             img = limpar_bordas(img, cleanup_thr, edge_radius=edge_radius)
         img = suavizar_borda_humana(src, img, bg_rgb, edge_radius=max(1, edge_radius))
         img = suavizar_serrilhado_alpha(img, edge_radius=max(1, edge_radius), blur_radius=0.72)
-        return sanitizar_rgb_transparente(img)
+        img = sanitizar_rgb_transparente(img)
+
+        # Filtro de cores: remove resíduos do fundo com base nas cores detectadas
+        active_colors = self._get_active_removal_colors()
+        if active_colors:
+            img = aplicar_color_key(
+                img, src, active_colors,
+                tolerance=self._color_key_tol.get(),
+                suppress_spill=self._spill_suppress.get()
+            )
+        return img
 
     def _process_all(self, targets):
         total = len(targets)
